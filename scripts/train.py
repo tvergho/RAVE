@@ -1,16 +1,35 @@
 import hashlib
 import os
 import sys
-
 import gin
 import pytorch_lightning as pl
 import torch
+import shutil
 from absl import flags
 from torch.utils.data import DataLoader
+from pytorch_lightning import Callback, Trainer
+from pytorch_lightning.loggers import WandbLogger
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from torch import LongTensor, Tensor, nn
+import dotenv
+from huggingface_hub import Repository
+
+from einops import rearrange
+import wandb
 
 import rave
 import rave.core
 import rave.dataset
+
+dotenv.load_dotenv(override=True)
+
+wandb_logger = pl.loggers.WandbLogger(
+    project="rave",
+    entity="tvergho1",
+    job_type="train",
+    group="",
+    save_dir="/logs"
+)
 
 FLAGS = flags.FLAGS
 
@@ -64,8 +83,6 @@ def main(argv):
 
     model = rave.RAVE()
 
-    print(model)
-
     if FLAGS.derivative:
         model.integrator = rave.dataset.get_derivator_integrator(model.sr)[1]
 
@@ -89,8 +106,8 @@ def main(argv):
 
     # CHECKPOINT CALLBACKS
     validation_checkpoint = pl.callbacks.ModelCheckpoint(monitor="validation",
-                                                         filename="best")
-    last_checkpoint = pl.callbacks.ModelCheckpoint(filename="last")
+                                                         filename="best", every_n_train_steps=FLAGS.val_every)
+    last_checkpoint = pl.callbacks.ModelCheckpoint(filename="last", every_n_train_steps=FLAGS.val_every)
 
     val_check = {}
     if len(train) >= FLAGS.val_every:
@@ -129,24 +146,30 @@ def main(argv):
         devices = 1
 
     trainer = pl.Trainer(
-        logger=pl.loggers.TensorBoardLogger(
-            "runs",
-            name=RUN_NAME,
-        ),
+        logger=[
+            pl.loggers.TensorBoardLogger(
+                "runs",
+                name=RUN_NAME,
+            ),
+            wandb_logger
+        ],
         accelerator=accelerator,
         devices=devices,
         callbacks=[
-            validation_checkpoint,
             last_checkpoint,
+            validation_checkpoint,
             rave.model.WarmupCallback(),
             rave.model.QuantizeCallback(),
             rave.core.LoggerCallback(rave.core.ProgressLogger(RUN_NAME)),
+            SampleLogger(),
+            # HuggingFaceHubCallback('tvergho/rave-maestro')
         ],
         max_epochs=100000,
         max_steps=FLAGS.max_steps,
         profiler="simple",
         enable_progress_bar=FLAGS.progress,
         **val_check,
+        log_every_n_steps=FLAGS.val_every,
     )
 
     run = rave.core.search_for_run(FLAGS.ckpt)
@@ -158,3 +181,102 @@ def main(argv):
         config_out.write(gin.operative_config_str())
 
     trainer.fit(model, train, val, ckpt_path=run)
+
+
+def get_wandb_logger(trainer: Trainer) -> Optional[WandbLogger]:
+    return wandb_logger
+
+
+def log_wandb_audio_batch(
+    logger: WandbLogger, id: str, samples: Tensor, sampling_rate: int, caption: str = ""
+):
+    num_items = samples.shape[0]
+    samples = rearrange(samples, "b c t -> b t c").detach().cpu().numpy()
+    logger.log(
+        {
+            f"sample_{idx}_{id}": wandb.Audio(
+                samples[idx],
+                caption=caption,
+                sample_rate=sampling_rate,
+            )
+            for idx in range(num_items)
+        }
+    )
+
+class SampleLogger(Callback):
+    def __init__(
+        self,
+    ) -> None:
+        self.num_items = 1
+        self.channels = 2
+        self.sampling_rate = 44100
+        self.num_steps = 20
+        self.log_next = False
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self.log_next = True
+
+    def on_validation_batch_start(
+        self, trainer, pl_module, batch, batch_idx, dataloader_idx
+    ):
+        if self.log_next:
+            self.log_sample(trainer, pl_module, batch)
+            self.log_next = False
+
+    @torch.no_grad()
+    def log_sample(self, trainer, pl_module, batch):
+        is_train = pl_module.training
+        if is_train:
+            pl_module.eval()
+
+        wandb_logger = get_wandb_logger(trainer).experiment
+
+        model = pl_module
+        k = model.encode(torch.randn(1, 1, 2**18))
+        x = torch.randn_like(k)
+        z = model.decode(x)
+        
+        log_wandb_audio_batch(
+            logger=wandb_logger,
+            id="sample_distribution",
+            samples=z,
+            sampling_rate=self.sampling_rate,
+            caption=f"Sampled in {self.num_steps} steps",
+        )
+
+        sample = batch[0].unsqueeze(0).unsqueeze(0)
+        log_wandb_audio_batch(
+            logger=wandb_logger,
+            id="original",
+            samples=sample,
+            sampling_rate=self.sampling_rate,
+            caption=f"Sampled in {self.num_steps} steps",
+        )
+
+        x = model.encode(sample)
+        y = model.decode(x)
+
+        log_wandb_audio_batch(
+            logger=wandb_logger,
+            id="decoded",
+            samples=y,
+            sampling_rate=self.sampling_rate,
+            caption=f"Sampled in {self.num_steps} steps",
+        )
+
+        if is_train:
+            pl_module.train()
+
+# class HuggingFaceHubCallback(Callback):
+#     def __init__(self, model_id: str):
+#         self.model_id = model_id
+#         self.local_dir = os.path.join(os.getcwd(), "rave-hub")
+#         self.repo = Repository(local_dir=self.local_dir, clone_from=model_id)
+#         self.repo.git_pull()
+    
+#     def on_validation_end(self, trainer, pl_module):
+#         path = trainer.checkpoint_callback.best_model_path
+#         print("Path", path)
+#         if os.path.exists(path):
+#             shutil.copy(path, self.local_dir)
+#             self.repo.push_to_hub(commit_message="Latest model", blocking=True)
