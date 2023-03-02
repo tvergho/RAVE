@@ -232,7 +232,7 @@ class SampleLogger(Callback):
         wandb_logger = get_wandb_logger(trainer).experiment
 
         model = pl_module
-        k = model.encode(torch.randn(1, 1, 2**18))
+        k = model.encode(torch.randn(1, 1, 2**18).to(model.device))
         x = torch.randn_like(k)
         z = model.decode(x)
         
